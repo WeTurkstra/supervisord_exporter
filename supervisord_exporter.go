@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
@@ -19,6 +20,9 @@ var (
 	metricsPath    string
 	version        bool
 	appVersion     float32 = 0.1
+
+	user string
+	pass string
 
 	processesMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -47,6 +51,8 @@ func init() {
 	flag.StringVar(&listenAddress, "web.listen-address", ":9876", "Address to listen for HTTP requests")
 	flag.StringVar(&metricsPath, "web.telemetry-path", "/metrics", "Path under which to expose metrics")
 	flag.BoolVar(&version, "version", false, "Displays application version")
+	flag.StringVar(&user, "user", "", "Username for basic auth")
+	flag.StringVar(&pass, "pass", "", "Password for basic auth")
 
 	flag.Parse()
 
@@ -55,8 +61,44 @@ func init() {
 	prometheus.MustRegister(supervisordUp)
 }
 
+// BasicAuthTransport is an http.RoundTripper that adds Basic Auth credentials to the request.
+type BasicAuthTransport struct {
+	Username  string
+	Password  string
+	Transport http.RoundTripper
+}
+
+func (t *BasicAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Ensure the Transport is set; if not, use http.DefaultTransport.
+	if t.Transport == nil {
+		t.Transport = http.DefaultTransport
+	}
+
+	// Encode the username and password in base64 for the Basic Auth header.
+	auth := t.Username + ":" + t.Password
+	authHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
+
+	// Clone the request to avoid modifying the original.
+	reqCopy := req.Clone(req.Context())
+	reqCopy.Header.Set("Authorization", authHeader)
+
+	// Perform the HTTP request using the specified Transport.
+	return t.Transport.RoundTrip(reqCopy)
+}
+
 func fetchSupervisorProcessInfo() {
-	client, err := xmlrpc.NewClient(supervisordURL, nil)
+
+	var transport http.RoundTripper = nil
+
+	if user != "" && pass != "" {
+		transport = &BasicAuthTransport{
+			Username: user,
+			Password: pass,
+		}
+	}
+
+	client, err := xmlrpc.NewClient(supervisordURL, transport)
+
 	if err != nil {
 		log.Printf("Error creating Supervisor XML-RPC client: %v", err)
 		supervisordUp.Set(0)
@@ -67,6 +109,7 @@ func fetchSupervisorProcessInfo() {
 	defer client.Close()
 
 	result := []map[string]interface{}{}
+
 	if err := client.Call("supervisor.getAllProcessInfo", nil, &result); err != nil {
 		log.Printf("Error calling Supervisor XML-RPC method: %v", err)
 		supervisordUp.Set(0)
